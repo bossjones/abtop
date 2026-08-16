@@ -39,6 +39,12 @@ impl TerminalJumper for CmuxJumper {
             Ok(o) if command_output_has_broken_pipe(&o.stdout, &o.stderr) => {
                 jump_via_applescript_after_socket_failure(&plan)
             }
+            Ok(o) if command_output_has_connection_refused(&o.stdout, &o.stderr) => {
+                // Stale socket file, cmux app not actually running — this
+                // session isn't really "in cmux" right now. Don't hard-fail
+                // the whole jump chain; let tmux/iTerm2 have a turn.
+                JumpAttempt::NotApplicable
+            }
             Ok(o) => JumpAttempt::Failed(format_command_failure(
                 "workspace select",
                 &o.status.to_string(),
@@ -154,6 +160,17 @@ fn command_output_contains(output: &[u8], needle: &str) -> bool {
 
 fn command_output_has_broken_pipe(stdout: &[u8], stderr: &[u8]) -> bool {
     command_output_contains(stderr, "Broken pipe") || command_output_contains(stdout, "Broken pipe")
+}
+
+/// True when the cmux CLI failed because its socket file is stale/orphaned
+/// (cmux itself isn't actually running, even though the socket file and the
+/// target process's inherited `CMUX_*` env vars still exist). Distinct from
+/// `Broken pipe`, whose AppleScript recovery path assumes the cmux *app* is
+/// still running — which is exactly what's false here, so that recovery
+/// would fail too. Callers should fall through to other jumpers instead.
+fn command_output_has_connection_refused(stdout: &[u8], stderr: &[u8]) -> bool {
+    command_output_contains(stderr, "Connection refused")
+        || command_output_contains(stdout, "Connection refused")
 }
 
 fn command_output_detail(output: &[u8]) -> Option<String> {
@@ -280,6 +297,18 @@ mod tests {
 
         assert_eq!(result, JumpAttempt::Jumped);
         assert!(called);
+    }
+
+    #[test]
+    fn detects_connection_refused_from_stale_socket() {
+        assert!(command_output_has_connection_refused(
+            b"",
+            b"Error: Failed to connect to socket at /Users/malcolm/.local/state/cmux/cmux.sock (Connection refused, errno 61)\n"
+        ));
+        assert!(!command_output_has_connection_refused(
+            b"",
+            b"Error: workspace not found\n"
+        ));
     }
 
     #[test]

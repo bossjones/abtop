@@ -969,7 +969,11 @@ fn parse_log_line(line: &str, result: &mut LogResult) {
     if let Some(uuid) = msg.strip_prefix("Workspace initialized: ") {
         // "e840638a-9964-44a8-b41e-4ca8afe82103 (checkpoints: 0)"
         let uuid = uuid.split_whitespace().next().unwrap_or("").trim();
-        if is_uuid(uuid) && result.session_id.is_empty() {
+        // A single process's log can show more than one of these (e.g.
+        // `--resume` logging a throwaway workspace before the one it
+        // actually resumes into). The latest one is the real, active
+        // session — always take it, not just the first.
+        if is_uuid(uuid) {
             result.session_id = uuid.to_string();
         }
         return;
@@ -1384,6 +1388,26 @@ mod tests {
             &mut result,
         );
         assert_eq!(result.session_id, "e840638a-9964-44a8-b41e-4ca8afe82103");
+    }
+
+    #[test]
+    fn parse_log_line_session_id_uses_latest_when_reinitialized() {
+        // A `--resume` invocation can log a throwaway "Workspace initialized"
+        // (no events.jsonl ever created for it) before the real, active
+        // workspace it actually resumed into. The later one must win, or the
+        // collector locks onto a dead session and reports zero stats for a
+        // process that's actively working. (Real example: PID 48701's log.)
+        let mut result = LogResult::default();
+        parse_log_line(
+            "2026-08-16T03:34:16.908Z [INFO] Workspace initialized: 0131a224-516f-4951-8d8e-c4e4866a6b6a (checkpoints: 0)",
+            &mut result,
+        );
+        assert_eq!(result.session_id, "0131a224-516f-4951-8d8e-c4e4866a6b6a");
+        parse_log_line(
+            "2026-08-16T03:34:18.741Z [INFO] Workspace initialized: 11fb9973-8b12-4518-9075-4c845e940fe1 (checkpoints: 0)",
+            &mut result,
+        );
+        assert_eq!(result.session_id, "11fb9973-8b12-4518-9075-4c845e940fe1");
     }
 
     #[test]
