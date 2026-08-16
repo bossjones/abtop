@@ -22,8 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///    have not been observed in any Copilot CLI build from 1.0.26 through
 ///    1.0.80 and are effectively dead in practice.
 /// 5. Get CWD from lsof/proc for the process
-/// 6. Read model from `~/.copilot/settings.json` as a last-resort fallback
-///    when no live model has been observed yet in `events.jsonl`
+/// 6. Read model/effort from `~/.copilot/settings.json` as a last-resort
+///    fallback when neither has been observed live yet in `events.jsonl`
 ///
 /// Key log patterns (from `process-{ts}-{pid}.log`):
 /// - `Workspace initialized: {uuid}` — session ID
@@ -33,8 +33,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Key event types (from `events.jsonl`), see `parse_events_line`:
 /// - `assistant.turn_start` — one per AI turn
-/// - `assistant.message` — carries `outputTokens` and the live `model`
-/// - `session.start` / `session.resume` — carries `selectedModel`
+/// - `assistant.message` — carries `outputTokens` and the live `model`;
+///   accumulated into `token_history` for the Tokens panel sparkline
+/// - `session.start` / `session.resume` — carries `selectedModel` and
+///   `reasoningEffort` (initial values, don't clobber live-observed ones)
+/// - `session.model_change` — carries `newModel` / `reasoningEffort` (live
+///   updates when the user switches model/effort mid-session)
 /// - `session.compaction_start` — carries `currentTokens` / `tokenLimit`
 pub struct CopilotCollector {
     logs_dir: PathBuf,
@@ -43,6 +47,8 @@ pub struct CopilotCollector {
     session_state_dir: PathBuf,
     /// Cached model name read from settings.json (refreshed on slow ticks).
     cached_model: String,
+    /// Cached reasoning effort level read from settings.json (refreshed on slow ticks).
+    cached_effort: String,
     /// Incremental log parse state, keyed by PID.
     log_cache: HashMap<u32, LogCache>,
     /// Incremental `events.jsonl` parse state, keyed by PID.
@@ -114,7 +120,16 @@ struct EventsResult {
     context_tokens: u64,
     /// Context window size (tokenLimit) as of the last `session.compaction_start` event.
     context_window: u64,
+    /// Most recently observed reasoning effort level (from `session.model_change`
+    /// or `session.start`/`session.resume`).
+    effort: String,
+    /// Per-turn `outputTokens` history, capped like Claude/Codex's equivalent
+    /// (`claude.rs`/`codex.rs`), for the Tokens panel sparkline.
+    token_history: Vec<u64>,
 }
+
+/// Same history cap used by `ClaudeCollector`/`CodexCollector`.
+const MAX_TOKEN_HISTORY: usize = 10_000;
 
 /// Parse one line of `events.jsonl` and fold it into `result`. Unknown event
 /// types and malformed lines are silently ignored.
@@ -139,6 +154,9 @@ fn parse_events_line(line: &str, result: &mut EventsResult) {
             .and_then(|t| t.as_u64())
         {
             result.total_output_tokens += tokens;
+            if result.token_history.len() < MAX_TOKEN_HISTORY {
+                result.token_history.push(tokens);
+            }
         }
         if let Some(model) = data.and_then(|d| d.get("model")).and_then(|m| m.as_str()) {
             if !model.is_empty() {
@@ -148,13 +166,40 @@ fn parse_events_line(line: &str, result: &mut EventsResult) {
         return;
     }
 
-    if (event_type == "session.start" || event_type == "session.resume") && result.model.is_empty()
-    {
+    if event_type == "session.start" || event_type == "session.resume" {
+        if result.model.is_empty() {
+            if let Some(model) = data
+                .and_then(|d| d.get("selectedModel"))
+                .and_then(|m| m.as_str())
+            {
+                result.model = model.to_string();
+            }
+        }
+        if result.effort.is_empty() {
+            if let Some(effort) = data
+                .and_then(|d| d.get("reasoningEffort"))
+                .and_then(|e| e.as_str())
+            {
+                result.effort = effort.to_string();
+            }
+        }
+        return;
+    }
+
+    if event_type == "session.model_change" {
         if let Some(model) = data
-            .and_then(|d| d.get("selectedModel"))
+            .and_then(|d| d.get("newModel"))
             .and_then(|m| m.as_str())
         {
-            result.model = model.to_string();
+            if !model.is_empty() {
+                result.model = model.to_string();
+            }
+        }
+        if let Some(effort) = data
+            .and_then(|d| d.get("reasoningEffort"))
+            .and_then(|e| e.as_str())
+        {
+            result.effort = effort.to_string();
         }
         return;
     }
@@ -183,6 +228,7 @@ impl CopilotCollector {
             settings_path: home.join(".copilot").join("settings.json"),
             session_state_dir: home.join(".copilot").join("session-state"),
             cached_model: String::new(),
+            cached_effort: String::new(),
             log_cache: HashMap::new(),
             events_cache: HashMap::new(),
         }
@@ -200,9 +246,13 @@ impl CopilotCollector {
 
         if shared.slow_tick {
             self.cached_model = read_model_from_settings(&self.settings_path);
+            self.cached_effort = read_effort_from_settings(&self.settings_path);
         }
         if self.cached_model.is_empty() {
             self.cached_model = read_model_from_settings(&self.settings_path);
+        }
+        if self.cached_effort.is_empty() {
+            self.cached_effort = read_effort_from_settings(&self.settings_path);
         }
 
         // Step 1: find running copilot PIDs
@@ -338,6 +388,7 @@ impl CopilotCollector {
             }
 
             let model = resolved_model(&events_result.model, &self.cached_model);
+            let effort = resolved_effort(&events_result.effort, &self.cached_effort);
             let turn_count = resolved_turn_count(events_result.turn_count, result.turn_count);
             let context_tokens =
                 resolved_context_tokens(events_result.context_tokens, result.context_tokens);
@@ -369,7 +420,7 @@ impl CopilotCollector {
                 started_at: result.started_at_ms,
                 status,
                 model,
-                effort: String::new(),
+                effort,
                 context_percent,
                 total_input_tokens: context_tokens,
                 total_output_tokens: events_result.total_output_tokens,
@@ -382,7 +433,7 @@ impl CopilotCollector {
                 git_branch,
                 git_added: 0,
                 git_modified: 0,
-                token_history: vec![],
+                token_history: events_result.token_history.clone(),
                 context_history: vec![],
                 compaction_count: 0,
                 context_window,
@@ -772,6 +823,21 @@ fn read_model_from_settings(path: &Path) -> String {
     json["model"].as_str().unwrap_or("").to_string()
 }
 
+/// Read the configured reasoning effort level from `~/.copilot/settings.json`.
+/// Last-resort fallback for when no live effort has been observed yet in
+/// `events.jsonl`.
+fn read_effort_from_settings(path: &Path) -> String {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    json["effortLevel"].as_str().unwrap_or("").to_string()
+}
+
 /// Get the current working directory of a process.
 /// On Linux, reads `/proc/{pid}/cwd` symlink.
 /// On macOS/other, uses `lsof -p {pid} -a -d cwd -F n`.
@@ -846,6 +912,16 @@ fn resolved_model(events_model: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         events_model.to_string()
+    }
+}
+
+/// Prefer the live reasoning effort observed in `events.jsonl`; fall back to
+/// the static `effortLevel` configured in `settings.json`.
+fn resolved_effort(events_effort: &str, fallback: &str) -> String {
+    if events_effort.is_empty() {
+        fallback.to_string()
+    } else {
+        events_effort.to_string()
     }
 }
 
@@ -1096,6 +1172,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_events_line_accumulates_token_history() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","outputTokens":517}}"#,
+            &mut result,
+        );
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m2","model":"claude-opus-4.8","outputTokens":93}}"#,
+            &mut result,
+        );
+        assert_eq!(result.token_history, vec![517, 93]);
+    }
+
+    #[test]
+    fn parse_events_line_token_history_is_capped_at_ten_thousand() {
+        let mut result = EventsResult::default();
+        for _ in 0..10_005 {
+            parse_events_line(
+                r#"{"type":"assistant.message","data":{"messageId":"m","model":"x","outputTokens":1}}"#,
+                &mut result,
+            );
+        }
+        assert_eq!(result.token_history.len(), 10_000);
+    }
+
+    #[test]
     fn parse_events_line_model_prefers_assistant_message_over_session_start() {
         let mut result = EventsResult::default();
         parse_events_line(
@@ -1124,6 +1226,44 @@ mod tests {
         assert_eq!(
             result.model, "claude-opus-4.8",
             "session.resume must not clobber a model already observed live"
+        );
+    }
+
+    #[test]
+    fn parse_events_line_session_model_change_updates_effort() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"session.model_change","data":{"contextTier":"default","newModel":"claude-opus-5","previousModel":"claude-opus-4.8","previousReasoningEffort":"xhigh","reasoningEffort":"medium"}}"#,
+            &mut result,
+        );
+        assert_eq!(result.effort, "medium");
+        assert_eq!(result.model, "claude-opus-5");
+    }
+
+    #[test]
+    fn parse_events_line_session_start_seeds_initial_effort() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"session.start","data":{"sessionId":"s1","selectedModel":"claude-opus-4.8","reasoningEffort":"xhigh"}}"#,
+            &mut result,
+        );
+        assert_eq!(result.effort, "xhigh");
+    }
+
+    #[test]
+    fn parse_events_line_session_resume_does_not_clobber_live_effort() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"session.model_change","data":{"newModel":"claude-opus-5","reasoningEffort":"medium"}}"#,
+            &mut result,
+        );
+        parse_events_line(
+            r#"{"type":"session.resume","data":{"sessionId":"s1","selectedModel":"gpt-5.5","reasoningEffort":"xhigh"}}"#,
+            &mut result,
+        );
+        assert_eq!(
+            result.effort, "medium",
+            "session.resume must not clobber an effort already observed live"
         );
     }
 
@@ -1198,12 +1338,33 @@ mod tests {
     }
 
     #[test]
+    fn read_effort_from_settings_reads_effort_level_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"model":"gpt-5.5","effortLevel":"xhigh"}"#).unwrap();
+        assert_eq!(read_effort_from_settings(&path), "xhigh");
+    }
+
+    #[test]
+    fn read_effort_from_settings_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        assert_eq!(read_effort_from_settings(&path), "");
+    }
+
+    #[test]
     fn resolved_model_prefers_events_over_fallback() {
         assert_eq!(
             resolved_model("claude-opus-4.8", "gpt-5.5"),
             "claude-opus-4.8"
         );
         assert_eq!(resolved_model("", "gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn resolved_effort_prefers_events_over_fallback() {
+        assert_eq!(resolved_effort("xhigh", "medium"), "xhigh");
+        assert_eq!(resolved_effort("", "medium"), "medium");
     }
 
     #[test]
