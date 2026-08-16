@@ -40,6 +40,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// - `session.model_change` — carries `newModel` / `reasoningEffort` (live
 ///   updates when the user switches model/effort mid-session)
 /// - `session.compaction_start` — carries `currentTokens` / `tokenLimit`
+///
+/// Optional richer telemetry via OpenTelemetry (opt-in, see
+/// `copilot help monitoring`): `events.jsonl` has no live per-turn input or
+/// cache-token counts — those only exist in Copilot CLI's OTel file exporter,
+/// disabled by default. If a Copilot process was launched with
+/// `COPILOT_OTEL_ENABLED=true` and `COPILOT_OTEL_FILE_EXPORTER_PATH=<path>`
+/// set, `find_otel_export_path` discovers that path from the process's own
+/// environment (`ps eww`) and `parse_otel_line` extracts full
+/// input/output/cache-read/cache-write tokens plus a live context-window
+/// snapshot from each "chat {model}" span — see `OtelResult`. When present,
+/// this takes priority over the `events.jsonl`-derived numbers above.
 pub struct CopilotCollector {
     logs_dir: PathBuf,
     settings_path: PathBuf,
@@ -53,6 +64,11 @@ pub struct CopilotCollector {
     log_cache: HashMap<u32, LogCache>,
     /// Incremental `events.jsonl` parse state, keyed by PID.
     events_cache: HashMap<u32, EventsCache>,
+    /// OTel file-exporter path discovered per PID (`None` if not opted in),
+    /// cached so `ps eww` only runs once per process rather than every tick.
+    otel_paths: HashMap<u32, Option<PathBuf>>,
+    /// Incremental OTel file-exporter parse state, keyed by PID.
+    otel_cache: HashMap<u32, OtelCache>,
 }
 
 /// Incremental parse state for a single Copilot CLI log file.
@@ -102,6 +118,20 @@ struct EventsCache {
     result: EventsResult,
 }
 
+/// Incremental parse state for an OTel file-exporter stream. The file may be
+/// shared across multiple concurrent Copilot CLI processes, so lines are
+/// filtered to `session_id` on every read.
+struct OtelCache {
+    path: PathBuf,
+    session_id: String,
+    /// Byte offset read so far.
+    offset: u64,
+    /// Buffer for an incomplete trailing line.
+    partial: String,
+    /// Cumulative parse result.
+    result: OtelResult,
+}
+
 /// Cumulative parse result from a Copilot CLI `events.jsonl` runtime telemetry
 /// file (`~/.copilot/session-state/{sessionId}/events.jsonl`). Unlike the
 /// human-readable log, this is a real per-session JSONL event stream and is
@@ -130,6 +160,118 @@ struct EventsResult {
 
 /// Same history cap used by `ClaudeCollector`/`CodexCollector`.
 const MAX_TOKEN_HISTORY: usize = 10_000;
+
+/// Cumulative parse result from a Copilot CLI OpenTelemetry file-exporter
+/// stream (opt-in via `COPILOT_OTEL_FILE_EXPORTER_PATH`, see
+/// `find_otel_export_path`). Each "chat {model}" span carries the full
+/// input/output/cache-read/cache-write token breakdown for one LLM call plus
+/// a live context-window snapshot — richer than anything `events.jsonl`
+/// exposes, but only present for sessions the user has explicitly opted in.
+#[derive(Default, Clone)]
+struct OtelResult {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read: u64,
+    total_cache_create: u64,
+    /// Per-call (input+output) history, capped like `EventsResult::token_history`.
+    token_history: Vec<u64>,
+    model: String,
+    effort: String,
+    /// Context tokens in use as of the most recent chat span's embedded
+    /// `github.copilot.session.usage_info` event.
+    context_tokens: u64,
+    /// Context window size as of the same event.
+    context_window: u64,
+    /// Number of matching "chat" spans folded in so far. Zero means this
+    /// session has no OTel data yet (or none at all) — callers should fall
+    /// back to the `events.jsonl`-based tracking in that case.
+    calls_seen: u32,
+}
+
+/// Parse one line of an OTel file-exporter JSONL stream and fold it into
+/// `result`, but only for spans belonging to `session_id` (the file may be
+/// shared across multiple concurrent Copilot CLI processes, disambiguated by
+/// `gen_ai.conversation.id`). Non-span records (metrics) and spans for other
+/// sessions are ignored.
+fn parse_otel_line(line: &str, session_id: &str, result: &mut OtelResult) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    if value.get("type").and_then(|t| t.as_str()) != Some("span") {
+        return;
+    }
+    let Some(attrs) = value.get("attributes") else {
+        return;
+    };
+    let Some(cid) = attrs.get("gen_ai.conversation.id").and_then(|c| c.as_str()) else {
+        return;
+    };
+    if cid != session_id {
+        return;
+    }
+    let Some(input) = attrs
+        .get("gen_ai.usage.input_tokens")
+        .and_then(|v| v.as_u64())
+    else {
+        return;
+    };
+    let output = attrs
+        .get("gen_ai.usage.output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = attrs
+        .get("gen_ai.usage.cache_read.input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_create = attrs
+        .get("gen_ai.usage.cache_creation.input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    result.total_input_tokens += input;
+    result.total_output_tokens += output;
+    result.total_cache_read += cache_read;
+    result.total_cache_create += cache_create;
+    result.calls_seen += 1;
+    if result.token_history.len() < MAX_TOKEN_HISTORY {
+        result.token_history.push(input + output);
+    }
+    if let Some(model) = attrs.get("gen_ai.response.model").and_then(|m| m.as_str()) {
+        if !model.is_empty() {
+            result.model = model.to_string();
+        }
+    }
+    if let Some(effort) = attrs
+        .get("gen_ai.request.reasoning.level")
+        .and_then(|e| e.as_str())
+    {
+        if !effort.is_empty() {
+            result.effort = effort.to_string();
+        }
+    }
+
+    if let Some(events) = value.get("events").and_then(|e| e.as_array()) {
+        for event in events {
+            if event.get("name").and_then(|n| n.as_str())
+                != Some("github.copilot.session.usage_info")
+            {
+                continue;
+            }
+            let Some(a) = event.get("attributes") else {
+                continue;
+            };
+            if let Some(cur) = a
+                .get("github.copilot.current_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                result.context_tokens = cur;
+            }
+            if let Some(limit) = a.get("github.copilot.token_limit").and_then(|v| v.as_u64()) {
+                result.context_window = limit;
+            }
+        }
+    }
+}
 
 /// Parse one line of `events.jsonl` and fold it into `result`. Unknown event
 /// types and malformed lines are silently ignored.
@@ -231,6 +373,8 @@ impl CopilotCollector {
             cached_effort: String::new(),
             log_cache: HashMap::new(),
             events_cache: HashMap::new(),
+            otel_paths: HashMap::new(),
+            otel_cache: HashMap::new(),
         }
     }
 
@@ -314,7 +458,46 @@ impl CopilotCollector {
                 };
             }
             update_events_cache(events_cache);
-            let events_result = &events_cache.result;
+            let events_result = events_cache.result.clone();
+
+            // Optional richer telemetry: if this process was launched with
+            // COPILOT_OTEL_FILE_EXPORTER_PATH set (see `copilot help
+            // monitoring`), it carries full input/cache-token accounting and
+            // a live context-window snapshot per LLM call — everything
+            // events.jsonl can't provide. Off by default; gracefully absent
+            // for the common case.
+            let otel_path = self
+                .otel_paths
+                .entry(pid)
+                .or_insert_with(|| find_otel_export_path(pid))
+                .clone();
+            if let Some(path) = &otel_path {
+                let needs_reset = self
+                    .otel_cache
+                    .get(&pid)
+                    .map(|c| c.path != *path || c.session_id != result.session_id)
+                    .unwrap_or(true);
+                if needs_reset {
+                    self.otel_cache.insert(
+                        pid,
+                        OtelCache {
+                            path: path.clone(),
+                            session_id: result.session_id.clone(),
+                            offset: 0,
+                            partial: String::new(),
+                            result: OtelResult::default(),
+                        },
+                    );
+                }
+                if let Some(cache) = self.otel_cache.get_mut(&pid) {
+                    update_otel_cache(cache);
+                }
+            }
+            let otel = self
+                .otel_cache
+                .get(&pid)
+                .filter(|c| c.result.calls_seen > 0)
+                .map(|c| c.result.clone());
 
             let proc = shared.process_info.get(&pid);
             let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
@@ -387,21 +570,56 @@ impl CopilotCollector {
                 }
             }
 
-            let model = resolved_model(&events_result.model, &self.cached_model);
-            let effort = resolved_effort(&events_result.effort, &self.cached_effort);
+            let events_model = resolved_model(&events_result.model, &self.cached_model);
+            let model = resolved_model(
+                otel.as_ref().map(|o| o.model.as_str()).unwrap_or(""),
+                &events_model,
+            );
+            let events_effort = resolved_effort(&events_result.effort, &self.cached_effort);
+            let effort = resolved_effort(
+                otel.as_ref().map(|o| o.effort.as_str()).unwrap_or(""),
+                &events_effort,
+            );
             let turn_count = resolved_turn_count(events_result.turn_count, result.turn_count);
-            let context_tokens =
+
+            let mut context_tokens =
                 resolved_context_tokens(events_result.context_tokens, result.context_tokens);
-            let context_window = resolved_context_window(
+            let mut context_window = resolved_context_window(
                 events_result.context_window,
                 result.context_window,
                 &model,
             );
+            // OTel's context snapshot updates on every LLM call (vs. only at
+            // compaction for events.jsonl), so prefer it when present.
+            if let Some(o) = otel.as_ref() {
+                if o.context_window > 0 {
+                    context_tokens = o.context_tokens;
+                    context_window = o.context_window;
+                }
+            }
             let context_percent = if context_tokens > 0 && context_window > 0 {
                 (context_tokens as f64 / context_window as f64) * 100.0
             } else {
                 0.0
             };
+
+            // OTel gives the full input/cache breakdown per call; without it,
+            // input/cache stay best-effort (only the compaction-derived
+            // context_tokens approximates "input", cache stays unknown).
+            let total_input_tokens = otel
+                .as_ref()
+                .map(|o| o.total_input_tokens)
+                .unwrap_or(context_tokens);
+            let total_output_tokens = otel
+                .as_ref()
+                .map(|o| o.total_output_tokens)
+                .unwrap_or(events_result.total_output_tokens);
+            let total_cache_read = otel.as_ref().map(|o| o.total_cache_read).unwrap_or(0);
+            let total_cache_create = otel.as_ref().map(|o| o.total_cache_create).unwrap_or(0);
+            let token_history = otel
+                .as_ref()
+                .map(|o| o.token_history.clone())
+                .unwrap_or_else(|| events_result.token_history.clone());
 
             let session_name = if !result.session_name.is_empty() {
                 result.session_name.clone()
@@ -422,10 +640,10 @@ impl CopilotCollector {
                 model,
                 effort,
                 context_percent,
-                total_input_tokens: context_tokens,
-                total_output_tokens: events_result.total_output_tokens,
-                total_cache_read: 0,
-                total_cache_create: 0,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read,
+                total_cache_create,
                 turn_count,
                 current_tasks,
                 mem_mb,
@@ -433,7 +651,7 @@ impl CopilotCollector {
                 git_branch,
                 git_added: 0,
                 git_modified: 0,
-                token_history: events_result.token_history.clone(),
+                token_history,
                 context_history: vec![],
                 compaction_count: 0,
                 context_window,
@@ -678,6 +896,62 @@ fn update_events_cache(cache: &mut EventsCache) {
     }
 }
 
+/// Parse/update an OTel file-exporter cache incrementally. Same
+/// incremental-read shape as `update_events_cache`/`update_log_cache`, but
+/// each complete line is filtered to `cache.session_id` by `parse_otel_line`
+/// since the file may be shared across concurrent Copilot CLI processes.
+fn update_otel_cache(cache: &mut OtelCache) {
+    let mut file = match fs::OpenOptions::new().read(true).open(&cache.path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    if file_len < cache.offset {
+        cache.offset = 0;
+        cache.partial.clear();
+        cache.result = OtelResult::default();
+    }
+
+    if file_len == cache.offset {
+        return;
+    }
+
+    if file.seek(SeekFrom::Start(cache.offset)).is_err() {
+        return;
+    }
+
+    let mut new_bytes = Vec::with_capacity((file_len - cache.offset).min(1024 * 1024) as usize);
+    if file.read_to_end(&mut new_bytes).is_err() {
+        return;
+    }
+
+    cache.offset = file_len;
+
+    let text = String::from_utf8_lossy(&new_bytes);
+    let combined = format!("{}{}", cache.partial, text);
+    cache.partial.clear();
+
+    let (complete, partial) = if let Some(last_nl) = combined.rfind('\n') {
+        (
+            combined[..last_nl].to_string(),
+            combined[last_nl + 1..].to_string(),
+        )
+    } else {
+        (String::new(), combined)
+    };
+
+    cache.partial = partial;
+
+    for line in complete.lines() {
+        parse_otel_line(line, &cache.session_id, &mut cache.result);
+    }
+}
+
 /// Parse a single log line and update the result.
 fn parse_log_line(line: &str, result: &mut LogResult) {
     // Extract timestamp from line start: "2026-05-07T07:41:48.151Z [INFO] ..."
@@ -887,6 +1161,42 @@ fn tasks_for_status(status: &SessionStatus) -> Vec<String> {
     }
 }
 
+/// Extract a single `KEY=value` token from `ps eww`-style output (env vars
+/// appended after COMMAND, space-separated). Used only to pull out one
+/// specific, non-secret variable name — never call this expecting to inspect
+/// or log the surrounding output, which may contain other processes'
+/// credentials/API keys.
+fn extract_ps_env_value(ps_output: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    ps_output
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix(&prefix))
+        .map(|v| v.to_string())
+}
+
+/// Discover the OpenTelemetry file-exporter path a Copilot CLI process was
+/// launched with, if any (`COPILOT_OTEL_FILE_EXPORTER_PATH`). This is how a
+/// user opts a session into full input/cache token + live context telemetry
+/// (see the `copilot help monitoring` topic) — disabled by default, so
+/// `None` is the common case. Reads the process's own environment via
+/// `ps eww`, which only works for processes owned by the current user; the
+/// full env blob (which may contain other processes' secrets) is discarded
+/// immediately after extracting this one value.
+#[cfg(not(windows))]
+fn find_otel_export_path(pid: u32) -> Option<PathBuf> {
+    let output = Command::new("ps")
+        .args(["eww", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    extract_ps_env_value(&stdout, "COPILOT_OTEL_FILE_EXPORTER_PATH").map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn find_otel_export_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 /// Get the current git branch for a directory.
 fn get_git_branch(cwd: &str) -> String {
     if cwd.is_empty() {
@@ -963,6 +1273,34 @@ fn resolved_context_window(events_window: u64, log_window: u64, model: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_ps_env_value_finds_the_key() {
+        let ps_output = "  PID   TT  STAT      TIME COMMAND\n95457   ??  SN     0:00.42 /opt/homebrew/Caskroom/copilot-cli/1.0.75/copilot -p hi HOME=/Users/malcolm COPILOT_OTEL_FILE_EXPORTER_PATH=/tmp/otel.jsonl COPILOT_OTEL_ENABLED=true PATH=/usr/bin";
+        assert_eq!(
+            extract_ps_env_value(ps_output, "COPILOT_OTEL_FILE_EXPORTER_PATH"),
+            Some("/tmp/otel.jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ps_env_value_missing_key_is_none() {
+        let ps_output = "  PID   TT  STAT      TIME COMMAND\n95457   ??  SN     0:00.42 /opt/homebrew/Caskroom/copilot-cli/1.0.75/copilot -p hi HOME=/Users/malcolm PATH=/usr/bin";
+        assert_eq!(
+            extract_ps_env_value(ps_output, "COPILOT_OTEL_FILE_EXPORTER_PATH"),
+            None
+        );
+    }
+
+    // `find_otel_export_path` itself is a thin `ps eww` wrapper around
+    // `extract_ps_env_value` (tested above) — same convention as
+    // `get_process_cwd`/`get_git_branch` in this file, which shell out and
+    // aren't unit tested directly. A process-spawn test was tried and
+    // dropped: macOS SIP hides environ from `ps eww` for system-protected
+    // binaries like `/bin/sh`/`/bin/sleep` even for their owning user, which
+    // made every reliable, dependency-free test fixture a false negative.
+    // The real `copilot` binary is an unprotected user-installed executable
+    // and was verified manually to work correctly.
 
     #[test]
     fn is_copilot_cli_matches_cask_path() {
@@ -1139,6 +1477,98 @@ mod tests {
             vec!["rate limited".to_string()]
         );
         assert!(tasks_for_status(&SessionStatus::Unknown).is_empty());
+    }
+
+    #[test]
+    fn parse_otel_line_accumulates_input_and_output_tokens() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.response.model":"gpt-5.5","gen_ai.request.reasoning.level":"xhigh","gen_ai.usage.input_tokens":36409,"gen_ai.usage.output_tokens":523}}"#;
+        parse_otel_line(line, "s1", &mut result);
+        assert_eq!(result.total_input_tokens, 36409);
+        assert_eq!(result.total_output_tokens, 523);
+        assert_eq!(result.calls_seen, 1);
+
+        let line2 = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.response.model":"gpt-5.5","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":10}}"#;
+        parse_otel_line(line2, "s1", &mut result);
+        assert_eq!(result.total_input_tokens, 36509);
+        assert_eq!(result.total_output_tokens, 533);
+        assert_eq!(result.calls_seen, 2);
+    }
+
+    #[test]
+    fn parse_otel_line_accumulates_cache_read_and_cache_creation() {
+        let mut result = OtelResult::default();
+        let read_line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.usage.input_tokens":36409,"gen_ai.usage.output_tokens":523,"gen_ai.usage.cache_read.input_tokens":24064}}"#;
+        parse_otel_line(read_line, "s1", &mut result);
+        assert_eq!(result.total_cache_read, 24064);
+        assert_eq!(result.total_cache_create, 0);
+
+        let write_line = r#"{"type":"span","name":"chat claude-opus-4.8","attributes":{"gen_ai.conversation.id":"s1","gen_ai.usage.input_tokens":66375,"gen_ai.usage.output_tokens":4,"gen_ai.usage.cache_creation.input_tokens":66373}}"#;
+        parse_otel_line(write_line, "s1", &mut result);
+        assert_eq!(result.total_cache_read, 24064);
+        assert_eq!(result.total_cache_create, 66373);
+    }
+
+    #[test]
+    fn parse_otel_line_accumulates_token_history_as_input_plus_output() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":25}}"#;
+        parse_otel_line(line, "s1", &mut result);
+        assert_eq!(result.token_history, vec![125]);
+    }
+
+    #[test]
+    fn parse_otel_line_extracts_live_model_and_effort() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat claude-opus-5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.response.model":"claude-opus-5","gen_ai.request.reasoning.level":"high","gen_ai.usage.input_tokens":1,"gen_ai.usage.output_tokens":1}}"#;
+        parse_otel_line(line, "s1", &mut result);
+        assert_eq!(result.model, "claude-opus-5");
+        assert_eq!(result.effort, "high");
+    }
+
+    #[test]
+    fn parse_otel_line_extracts_context_from_embedded_usage_info_event() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.usage.input_tokens":1,"gen_ai.usage.output_tokens":1},"events":[{"name":"github.copilot.session.usage_info","attributes":{"github.copilot.token_limit":272000,"github.copilot.current_tokens":41276,"github.copilot.messages_length":3}}]}"#;
+        parse_otel_line(line, "s1", &mut result);
+        assert_eq!(result.context_tokens, 41276);
+        assert_eq!(result.context_window, 272000);
+    }
+
+    #[test]
+    fn parse_otel_line_ignores_spans_for_other_sessions() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"other-session","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":10}}"#;
+        parse_otel_line(line, "s1", &mut result);
+        assert_eq!(result.calls_seen, 0);
+        assert_eq!(result.total_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_otel_line_token_history_is_capped_at_ten_thousand() {
+        let mut result = OtelResult::default();
+        let line = r#"{"type":"span","name":"chat gpt-5.5","attributes":{"gen_ai.conversation.id":"s1","gen_ai.usage.input_tokens":1,"gen_ai.usage.output_tokens":1}}"#;
+        for _ in 0..10_005 {
+            parse_otel_line(line, "s1", &mut result);
+        }
+        assert_eq!(result.token_history.len(), 10_000);
+        assert_eq!(result.calls_seen, 10_005);
+    }
+
+    #[test]
+    fn parse_otel_line_ignores_non_chat_spans_and_metrics() {
+        let mut result = OtelResult::default();
+        parse_otel_line(
+            r#"{"type":"span","name":"invoke_agent","attributes":{"gen_ai.conversation.id":"s1"}}"#,
+            "s1",
+            &mut result,
+        );
+        parse_otel_line(
+            r#"{"type":"metric","name":"gen_ai.client.token.usage","dataPoints":[]}"#,
+            "s1",
+            &mut result,
+        );
+        assert_eq!(result.calls_seen, 0);
     }
 
     #[test]
@@ -1335,6 +1765,58 @@ mod tests {
         };
         update_events_cache(&mut cache);
         assert_eq!(cache.result.turn_count, 0);
+    }
+
+    #[test]
+    fn update_otel_cache_reads_new_lines_incrementally_for_matching_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("otel.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"span\",\"name\":\"chat gpt-5.5\",\"attributes\":{\"gen_ai.conversation.id\":\"s1\",\"gen_ai.usage.input_tokens\":100,\"gen_ai.usage.output_tokens\":10}}\n",
+        )
+        .unwrap();
+
+        let mut cache = OtelCache {
+            path: path.clone(),
+            session_id: "s1".to_string(),
+            offset: 0,
+            partial: String::new(),
+            result: OtelResult::default(),
+        };
+        update_otel_cache(&mut cache);
+        assert_eq!(cache.result.calls_seen, 1);
+        assert_eq!(cache.result.total_input_tokens, 100);
+
+        // Append a second line, from a DIFFERENT session — must not accumulate.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            "{{\"type\":\"span\",\"name\":\"chat gpt-5.5\",\"attributes\":{{\"gen_ai.conversation.id\":\"other\",\"gen_ai.usage.input_tokens\":999,\"gen_ai.usage.output_tokens\":1}}}}"
+        )
+        .unwrap();
+        update_otel_cache(&mut cache);
+        assert_eq!(
+            cache.result.calls_seen, 1,
+            "line from another session must be ignored"
+        );
+        assert_eq!(cache.result.total_input_tokens, 100);
+    }
+
+    #[test]
+    fn update_otel_cache_missing_file_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        let mut cache = OtelCache {
+            path,
+            session_id: "s1".to_string(),
+            offset: 0,
+            partial: String::new(),
+            result: OtelResult::default(),
+        };
+        update_otel_cache(&mut cache);
+        assert_eq!(cache.result.calls_seen, 0);
     }
 
     #[test]
