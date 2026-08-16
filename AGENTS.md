@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
+Supports Claude Code, Codex CLI, OpenCode, and GitHub Copilot CLI sessions.
 
 ## Language Policy
 
@@ -29,6 +29,7 @@ src/
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
+│   ├── copilot.rs          # Copilot CLI: session discovery via ps + log file parsing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -173,6 +174,13 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
+### 4b. Copilot CLI sessions: `~/.copilot/logs/process-{timestamp}-{pid}.log`
+- Discover running `copilot` processes via shared `ps` data, excluding `copilot-language-server` and IDE plugin processes.
+- Match each PID to its log file by the `{pid}` component in the log filename; incrementally parse new bytes on each tick rather than re-reading the whole file.
+- Extract session id (`Workspace initialized: {uuid}`), version, session name, repository, context utilization, and turn count from known log line patterns.
+- Model name is read separately from `~/.copilot/settings.json`.
+- Copilot CLI contributes session/token/context/project/port data, but not quota data (no account-level rate-limit source is exposed). Quota remains Claude + Codex only.
+
 ### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
@@ -229,7 +237,7 @@ File format read by abtop:
 
 **Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick.
 
-**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, or OpenCode) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
+**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, OpenCode, or Copilot CLI) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
 - Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)

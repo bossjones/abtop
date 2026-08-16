@@ -1002,6 +1002,7 @@ fn is_supported_agent_command(cmd: &str) -> bool {
     crate::collector::process::cmd_has_binary(cmd, "claude")
         || crate::collector::process::cmd_has_binary(cmd, "codex")
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
+        || crate::collector::process::cmd_has_binary(cmd, "copilot")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {
@@ -1105,9 +1106,21 @@ mod tests {
     }
 
     #[test]
+    fn supported_agent_command_accepts_copilot() {
+        assert!(is_supported_agent_command(
+            "/opt/homebrew/Caskroom/copilot-cli/1.0.26/copilot"
+        ));
+        assert!(is_supported_agent_command("copilot --banner"));
+        assert!(!is_supported_agent_command(
+            "copilot-language-server --stdio"
+        ));
+    }
+
+    #[test]
     fn killable_agent_command_rejects_codex_app_server() {
         assert!(is_killable_agent_command("codex --resume abc"));
         assert!(is_killable_agent_command("/usr/local/bin/claude"));
+        assert!(is_killable_agent_command("copilot"));
         assert!(!is_killable_agent_command(
             "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));

@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, OpenCode, and GitHub Copilot CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code, Codex CLI, OpenCode, and Copilot CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -75,20 +75,30 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | Copilot CLI |
+| ----------------- | :---------: | :-------: | :------: | :---------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |     ✅      |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |     ⚠️      |
+| Context Window %  |     ✅      |    ✅     |    ❌    |     ✅      |
+| Status Detection  |     ✅      |    ✅     |    ✅    |     ✅      |
+| Current Task      |     ✅      |    ✅     |    ❌    |     ⚠️      |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |     ❌      |
+| Git Status        |     ✅      |    ✅     |    ✅    |     ✅      |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |     ✅      |
+| Subagents         |     ✅      |    ❌     |    ❌    |     ❌      |
+| Memory Status     |     ✅      |    ❌     |    ❌    |     ❌      |
+
+⚠️ = Copilot CLI reports input/context tokens only (no output or cache token
+accounting), and "Current Task" is a synthetic status string rather than real
+task text — both are limits of what the Copilot CLI's own logs expose.
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+
+Copilot CLI support discovers running `copilot` processes and matches each to its
+`~/.copilot/logs/process-{timestamp}-{pid}.log` file, incrementally parsing new
+log lines for session id, version, session name, repository, context
+utilization, and turn count. The configured model name is read from
+`~/.copilot/settings.json`.
 
 ## Themes
 
