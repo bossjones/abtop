@@ -12,25 +12,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Discovery strategy:
 /// 1. `ps` to find running `copilot` processes (path contains `copilot-cli`)
 /// 2. Scan `~/.copilot/logs/process-{ts}-{pid}.log` for a log file matching each PID
-/// 3. Parse log file for session ID, version, session name, context utilization, turn count
-/// 4. Get CWD from lsof/proc for the process
-/// 5. Read model from `~/.copilot/settings.json`
+/// 3. Parse log file for session ID, version, session name, git repository
+/// 4. Given the session ID, incrementally parse
+///    `~/.copilot/session-state/{sessionId}/events.jsonl` for live turn count,
+///    output tokens, model, and context usage — see `EventsResult` below. This
+///    is the real runtime telemetry source on current Copilot CLI builds; the
+///    older `CompactionProcessor`/`Sending request` log-line patterns this
+///    collector also still recognizes (for forward/backward compatibility)
+///    have not been observed in any Copilot CLI build from 1.0.26 through
+///    1.0.80 and are effectively dead in practice.
+/// 5. Get CWD from lsof/proc for the process
+/// 6. Read model from `~/.copilot/settings.json` as a last-resort fallback
+///    when no live model has been observed yet in `events.jsonl`
 ///
-/// Key log patterns:
+/// Key log patterns (from `process-{ts}-{pid}.log`):
 /// - `Workspace initialized: {uuid}` — session ID
 /// - `Starting Copilot CLI: {version}` — CLI version
 /// - `Session named: "{name}"` — session title after first AI response
 /// - `Session indexing debug: ..., repository={owner}/{repo}` — git remote
-/// - `CompactionProcessor: Utilization {pct}% ({used}/{total} tokens)` — context usage
-/// - `--- Start of group: Sending request to the AI model ---` — AI turn starts
-/// - `--- End of group ---` — AI turn ends
+///
+/// Key event types (from `events.jsonl`), see `parse_events_line`:
+/// - `assistant.turn_start` — one per AI turn
+/// - `assistant.message` — carries `outputTokens` and the live `model`
+/// - `session.start` / `session.resume` — carries `selectedModel`
+/// - `session.compaction_start` — carries `currentTokens` / `tokenLimit`
 pub struct CopilotCollector {
     logs_dir: PathBuf,
     settings_path: PathBuf,
+    /// `~/.copilot/session-state` — parent of each session's `events.jsonl`.
+    session_state_dir: PathBuf,
     /// Cached model name read from settings.json (refreshed on slow ticks).
     cached_model: String,
     /// Incremental log parse state, keyed by PID.
     log_cache: HashMap<u32, LogCache>,
+    /// Incremental `events.jsonl` parse state, keyed by PID.
+    events_cache: HashMap<u32, EventsCache>,
 }
 
 /// Incremental parse state for a single Copilot CLI log file.
@@ -69,14 +85,106 @@ struct LogResult {
     last_event_ms: u64,
 }
 
+/// Incremental parse state for a single Copilot CLI `events.jsonl` file.
+struct EventsCache {
+    path: PathBuf,
+    /// Byte offset read so far.
+    offset: u64,
+    /// Buffer for an incomplete trailing line.
+    partial: String,
+    /// Cumulative parse result.
+    result: EventsResult,
+}
+
+/// Cumulative parse result from a Copilot CLI `events.jsonl` runtime telemetry
+/// file (`~/.copilot/session-state/{sessionId}/events.jsonl`). Unlike the
+/// human-readable log, this is a real per-session JSONL event stream and is
+/// where turn/token/context data actually lives in current Copilot CLI builds
+/// (the log-file patterns above no longer carry it).
+#[derive(Default, Clone)]
+struct EventsResult {
+    /// Number of `assistant.turn_start` events seen.
+    turn_count: u32,
+    /// Cumulative `outputTokens` summed across `assistant.message` events.
+    total_output_tokens: u64,
+    /// Most recently observed model name (from `assistant.message` or
+    /// `session.start`/`session.resume`).
+    model: String,
+    /// Context tokens in use as of the last `session.compaction_start` event.
+    context_tokens: u64,
+    /// Context window size (tokenLimit) as of the last `session.compaction_start` event.
+    context_window: u64,
+}
+
+/// Parse one line of `events.jsonl` and fold it into `result`. Unknown event
+/// types and malformed lines are silently ignored.
+fn parse_events_line(line: &str, result: &mut EventsResult) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(event_type) = value.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
+
+    if event_type == "assistant.turn_start" {
+        result.turn_count += 1;
+        return;
+    }
+
+    let data = value.get("data");
+
+    if event_type == "assistant.message" {
+        if let Some(tokens) = data
+            .and_then(|d| d.get("outputTokens"))
+            .and_then(|t| t.as_u64())
+        {
+            result.total_output_tokens += tokens;
+        }
+        if let Some(model) = data.and_then(|d| d.get("model")).and_then(|m| m.as_str()) {
+            if !model.is_empty() {
+                result.model = model.to_string();
+            }
+        }
+        return;
+    }
+
+    if (event_type == "session.start" || event_type == "session.resume") && result.model.is_empty()
+    {
+        if let Some(model) = data
+            .and_then(|d| d.get("selectedModel"))
+            .and_then(|m| m.as_str())
+        {
+            result.model = model.to_string();
+        }
+        return;
+    }
+
+    if event_type == "session.compaction_start" {
+        if let Some(cur) = data
+            .and_then(|d| d.get("currentTokens"))
+            .and_then(|t| t.as_u64())
+        {
+            result.context_tokens = cur;
+        }
+        if let Some(limit) = data
+            .and_then(|d| d.get("tokenLimit"))
+            .and_then(|t| t.as_u64())
+        {
+            result.context_window = limit;
+        }
+    }
+}
+
 impl CopilotCollector {
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
             logs_dir: home.join(".copilot").join("logs"),
             settings_path: home.join(".copilot").join("settings.json"),
+            session_state_dir: home.join(".copilot").join("session-state"),
             cached_model: String::new(),
             log_cache: HashMap::new(),
+            events_cache: HashMap::new(),
         }
     }
 
@@ -134,6 +242,29 @@ impl CopilotCollector {
             if result.session_id.is_empty() {
                 continue;
             }
+
+            // Runtime telemetry (turns/tokens/context/live model) lives in
+            // events.jsonl, not the log file, on current Copilot CLI builds.
+            let events_path = self
+                .session_state_dir
+                .join(&result.session_id)
+                .join("events.jsonl");
+            let events_cache = self.events_cache.entry(pid).or_insert_with(|| EventsCache {
+                path: events_path.clone(),
+                offset: 0,
+                partial: String::new(),
+                result: EventsResult::default(),
+            });
+            if events_cache.path != events_path {
+                *events_cache = EventsCache {
+                    path: events_path.clone(),
+                    offset: 0,
+                    partial: String::new(),
+                    result: EventsResult::default(),
+                };
+            }
+            update_events_cache(events_cache);
+            let events_result = &events_cache.result;
 
             let proc = shared.process_info.get(&pid);
             let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
@@ -206,8 +337,17 @@ impl CopilotCollector {
                 }
             }
 
-            let context_percent = if result.context_window > 0 {
-                result.context_pct
+            let model = resolved_model(&events_result.model, &self.cached_model);
+            let turn_count = resolved_turn_count(events_result.turn_count, result.turn_count);
+            let context_tokens =
+                resolved_context_tokens(events_result.context_tokens, result.context_tokens);
+            let context_window = resolved_context_window(
+                events_result.context_window,
+                result.context_window,
+                &model,
+            );
+            let context_percent = if context_tokens > 0 && context_window > 0 {
+                (context_tokens as f64 / context_window as f64) * 100.0
             } else {
                 0.0
             };
@@ -228,14 +368,14 @@ impl CopilotCollector {
                 project_name,
                 started_at: result.started_at_ms,
                 status,
-                model: self.cached_model.clone(),
+                model,
                 effort: String::new(),
                 context_percent,
-                total_input_tokens: result.context_tokens,
-                total_output_tokens: 0,
+                total_input_tokens: context_tokens,
+                total_output_tokens: events_result.total_output_tokens,
                 total_cache_read: 0,
                 total_cache_create: 0,
-                turn_count: result.turn_count,
+                turn_count,
                 current_tasks,
                 mem_mb,
                 version: result.version.clone(),
@@ -245,7 +385,7 @@ impl CopilotCollector {
                 token_history: vec![],
                 context_history: vec![],
                 compaction_count: 0,
-                context_window: result.context_window,
+                context_window,
                 subagents: vec![],
                 mem_file_count: 0,
                 mem_line_count: 0,
@@ -263,6 +403,7 @@ impl CopilotCollector {
 
         // Evict stale cache entries (PIDs no longer running)
         self.log_cache.retain(|pid, _| seen_pids.contains(pid));
+        self.events_cache.retain(|pid, _| seen_pids.contains(pid));
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
@@ -428,6 +569,61 @@ fn update_log_cache(cache: &mut LogCache) {
 
     for line in complete.lines() {
         parse_log_line(line, &mut cache.result);
+    }
+}
+
+/// Parse/update an `events.jsonl` cache incrementally. Same incremental-read
+/// shape as `update_log_cache`, but each complete line is a JSON object parsed
+/// by `parse_events_line` rather than a human-readable log line.
+fn update_events_cache(cache: &mut EventsCache) {
+    let mut file = match fs::OpenOptions::new().read(true).open(&cache.path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    if file_len < cache.offset {
+        cache.offset = 0;
+        cache.partial.clear();
+        cache.result = EventsResult::default();
+    }
+
+    if file_len == cache.offset {
+        return;
+    }
+
+    if file.seek(SeekFrom::Start(cache.offset)).is_err() {
+        return;
+    }
+
+    let mut new_bytes = Vec::with_capacity((file_len - cache.offset).min(1024 * 1024) as usize);
+    if file.read_to_end(&mut new_bytes).is_err() {
+        return;
+    }
+
+    cache.offset = file_len;
+
+    let text = String::from_utf8_lossy(&new_bytes);
+    let combined = format!("{}{}", cache.partial, text);
+    cache.partial.clear();
+
+    let (complete, partial) = if let Some(last_nl) = combined.rfind('\n') {
+        (
+            combined[..last_nl].to_string(),
+            combined[last_nl + 1..].to_string(),
+        )
+    } else {
+        (String::new(), combined)
+    };
+
+    cache.partial = partial;
+
+    for line in complete.lines() {
+        parse_events_line(line, &mut cache.result);
     }
 }
 
@@ -642,6 +838,52 @@ fn get_git_branch(cwd: &str) -> String {
     String::new()
 }
 
+/// Prefer the live model observed in `events.jsonl`; fall back to the
+/// globally configured model from `settings.json` when the session hasn't
+/// emitted one yet (e.g. very first tick).
+fn resolved_model(events_model: &str, fallback: &str) -> String {
+    if events_model.is_empty() {
+        fallback.to_string()
+    } else {
+        events_model.to_string()
+    }
+}
+
+/// Prefer the live turn count from `events.jsonl`; fall back to the log-based
+/// count (dead in current Copilot CLI builds, kept for forward/backward
+/// compatibility in case some build still emits the old log markers).
+fn resolved_turn_count(events_turns: u32, log_turns: u32) -> u32 {
+    if events_turns > 0 {
+        events_turns
+    } else {
+        log_turns
+    }
+}
+
+/// Prefer the live context-tokens-in-use figure from the last
+/// `session.compaction_start` event; fall back to the log-based figure.
+fn resolved_context_tokens(events_tokens: u64, log_tokens: u64) -> u64 {
+    if events_tokens > 0 {
+        events_tokens
+    } else {
+        log_tokens
+    }
+}
+
+/// Prefer the live context window (tokenLimit) from the last
+/// `session.compaction_start` event; fall back to the log-based figure; and
+/// failing both (no compaction has occurred yet this session), fall back to
+/// the same model-name heuristic used by the other collectors.
+fn resolved_context_window(events_window: u64, log_window: u64, model: &str) -> u64 {
+    if events_window > 0 {
+        events_window
+    } else if log_window > 0 {
+        log_window
+    } else {
+        crate::collector::context_window_for_model(model, "", 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +1063,176 @@ mod tests {
             vec!["rate limited".to_string()]
         );
         assert!(tasks_for_status(&SessionStatus::Unknown).is_empty());
+    }
+
+    #[test]
+    fn parse_events_line_counts_turn_start() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"assistant.turn_start","data":{"turnId":"1"},"id":"a","timestamp":"2026-08-16T01:01:44.619Z"}"#,
+            &mut result,
+        );
+        assert_eq!(result.turn_count, 1);
+        parse_events_line(
+            r#"{"type":"assistant.turn_start","data":{"turnId":"2"},"id":"b","timestamp":"2026-08-16T01:02:44.619Z"}"#,
+            &mut result,
+        );
+        assert_eq!(result.turn_count, 2);
+    }
+
+    #[test]
+    fn parse_events_line_accumulates_output_tokens() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","outputTokens":517}}"#,
+            &mut result,
+        );
+        assert_eq!(result.total_output_tokens, 517);
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m2","model":"claude-opus-4.8","outputTokens":93}}"#,
+            &mut result,
+        );
+        assert_eq!(result.total_output_tokens, 610);
+    }
+
+    #[test]
+    fn parse_events_line_model_prefers_assistant_message_over_session_start() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"session.start","data":{"sessionId":"s1","selectedModel":"gpt-5.5"}}"#,
+            &mut result,
+        );
+        assert_eq!(result.model, "gpt-5.5");
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","outputTokens":10}}"#,
+            &mut result,
+        );
+        assert_eq!(result.model, "claude-opus-4.8");
+    }
+
+    #[test]
+    fn parse_events_line_session_resume_sets_model_only_when_unset() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","outputTokens":10}}"#,
+            &mut result,
+        );
+        parse_events_line(
+            r#"{"type":"session.resume","data":{"sessionId":"s1","selectedModel":"gpt-5.5"}}"#,
+            &mut result,
+        );
+        assert_eq!(
+            result.model, "claude-opus-4.8",
+            "session.resume must not clobber a model already observed live"
+        );
+    }
+
+    #[test]
+    fn parse_events_line_captures_context_from_compaction_start() {
+        let mut result = EventsResult::default();
+        parse_events_line(
+            r#"{"type":"session.compaction_start","data":{"systemTokens":15570,"conversationTokens":136711,"toolDefinitionsTokens":9551,"currentTokens":161832,"tokenLimit":200000,"trigger":"threshold"}}"#,
+            &mut result,
+        );
+        assert_eq!(result.context_tokens, 161832);
+        assert_eq!(result.context_window, 200000);
+    }
+
+    #[test]
+    fn parse_events_line_ignores_malformed_and_unknown_lines() {
+        let mut result = EventsResult::default();
+        parse_events_line("not json at all", &mut result);
+        parse_events_line("", &mut result);
+        parse_events_line(r#"{"type":"tool.execution_start","data":{}}"#, &mut result);
+        parse_events_line(r#"{"no_type_field":true}"#, &mut result);
+        assert_eq!(result.turn_count, 0);
+        assert_eq!(result.total_output_tokens, 0);
+        assert!(result.model.is_empty());
+        assert_eq!(result.context_tokens, 0);
+        assert_eq!(result.context_window, 0);
+    }
+
+    #[test]
+    fn update_events_cache_reads_new_lines_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"assistant.turn_start\",\"data\":{\"turnId\":\"1\"}}\n",
+        )
+        .unwrap();
+
+        let mut cache = EventsCache {
+            path: path.clone(),
+            offset: 0,
+            partial: String::new(),
+            result: EventsResult::default(),
+        };
+        update_events_cache(&mut cache);
+        assert_eq!(cache.result.turn_count, 1);
+
+        // Append a second line; only the new bytes should be parsed.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            "{{\"type\":\"assistant.turn_start\",\"data\":{{\"turnId\":\"2\"}}}}"
+        )
+        .unwrap();
+        update_events_cache(&mut cache);
+        assert_eq!(cache.result.turn_count, 2);
+    }
+
+    #[test]
+    fn update_events_cache_missing_file_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        let mut cache = EventsCache {
+            path,
+            offset: 0,
+            partial: String::new(),
+            result: EventsResult::default(),
+        };
+        update_events_cache(&mut cache);
+        assert_eq!(cache.result.turn_count, 0);
+    }
+
+    #[test]
+    fn resolved_model_prefers_events_over_fallback() {
+        assert_eq!(
+            resolved_model("claude-opus-4.8", "gpt-5.5"),
+            "claude-opus-4.8"
+        );
+        assert_eq!(resolved_model("", "gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn resolved_turn_count_prefers_events_over_log() {
+        assert_eq!(resolved_turn_count(7, 0), 7);
+        assert_eq!(resolved_turn_count(0, 3), 3);
+        assert_eq!(resolved_turn_count(0, 0), 0);
+    }
+
+    #[test]
+    fn resolved_context_tokens_prefers_events_over_log() {
+        assert_eq!(resolved_context_tokens(161832, 0), 161832);
+        assert_eq!(resolved_context_tokens(0, 5000), 5000);
+    }
+
+    #[test]
+    fn resolved_context_window_falls_back_to_model_heuristic() {
+        assert_eq!(
+            resolved_context_window(200_000, 0, "claude-opus-4.8"),
+            200_000
+        );
+        assert_eq!(
+            resolved_context_window(0, 128_000, "claude-opus-4.8"),
+            128_000
+        );
+        assert_eq!(
+            resolved_context_window(0, 0, "claude-opus-4.8[1m]"),
+            1_000_000
+        );
+        assert_eq!(resolved_context_window(0, 0, "claude-opus-4.8"), 200_000);
     }
 }
