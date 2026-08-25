@@ -389,4 +389,17 @@ mod tests {
         assert!(readme.contains("chat_messages"));
         assert!(readme.contains("summary"));
     }
+
+    #[test]
+    fn readme_documents_copilot_support() {
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains("Copilot CLI"),
+            "Supported Agents table missing Copilot column"
+        );
+        assert!(
+            readme.contains("~/.copilot/logs"),
+            "README missing Copilot discovery description"
+        );
+    }
 }

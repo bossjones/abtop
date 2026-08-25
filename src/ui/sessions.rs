@@ -14,6 +14,22 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     draw_sessions_panel_active(f, app, area, theme, false);
 }
 
+/// Map an `agent_cli` identifier to its short session-table mark and color.
+/// Unrecognized agents fall back to their first 3 chars uppercased, in the
+/// theme's inactive color.
+pub(crate) fn agent_label(agent_cli: &str, theme: &Theme) -> (String, Color) {
+    match agent_cli {
+        "claude" => ("*CC".to_string(), Color::Rgb(217, 119, 87)), // #D97757 terracotta
+        "codex" => (">CD".to_string(), Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+        "opencode" => ("#OC".to_string(), Color::Rgb(74, 222, 128)), // #4ADE80 emerald
+        "copilot" => ("^CP".to_string(), Color::Rgb(45, 212, 191)), // #2DD4BF teal
+        other => {
+            let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
+            (fallback, theme.inactive_fg)
+        }
+    }
+}
+
 pub(crate) fn draw_sessions_panel_active(
     f: &mut Frame,
     app: &App,
@@ -133,18 +149,7 @@ pub(crate) fn draw_sessions_panel_active(
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
-        let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
-            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
-            other => {
-                let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
-                (
-                    Box::leak(fallback.into_boxed_str()) as &str,
-                    theme.inactive_fg,
-                )
-            }
-        };
+        let (agent_label, agent_color) = agent_label(session.agent_cli, theme);
 
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
@@ -1262,6 +1267,28 @@ mod tests {
             tool_color("exec_command", &theme),
             tool_color("Bash", &theme)
         );
+    }
+
+    #[test]
+    fn agent_label_copilot_is_teal_cp() {
+        let theme = Theme::default();
+        assert_eq!(
+            agent_label("copilot", &theme),
+            ("^CP".to_string(), Color::Rgb(45, 212, 191))
+        );
+    }
+
+    #[test]
+    fn agent_label_known_agents_keep_their_marks() {
+        let theme = Theme::default();
+        assert_eq!(agent_label("claude", &theme).0, "*CC");
+        assert_eq!(agent_label("codex", &theme).0, ">CD");
+        assert_eq!(agent_label("opencode", &theme).0, "#OC");
+    }
+
+    #[test]
+    fn agent_label_unknown_agent_truncates_to_three_chars() {
+        assert_eq!(agent_label("gemini", &Theme::default()).0, "GEM");
     }
 
     #[test]

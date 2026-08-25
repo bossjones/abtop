@@ -509,6 +509,46 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "copilot",
+            pid: 9612,
+            session_id: "e840638a-9964-44a8-b41e-4ca8afe82103".into(),
+            cwd: "/Users/demo/api-gateway".into(),
+            project_name: "api-gateway".into(),
+            started_at: now - 4 * 60 * 1000, // 4m ago
+            status: SessionStatus::Waiting,
+            model: "gpt-5".into(),
+            effort: String::new(),
+            context_percent: 12.5,
+            total_input_tokens: 16_000,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 3,
+            current_tasks: vec!["waiting for input".into()],
+            mem_mb: 98,
+            version: "1.0.43".into(),
+            git_branch: "main".into(),
+            git_added: 2,
+            git_modified: 5,
+            token_history: vec![],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 128_000,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            initial_prompt: "Add GitHub Copilot CLI Support".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.copilot".into(),
+            file_accesses: vec![],
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -584,4 +624,19 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::PanelVisibility;
+    use crate::theme::Theme;
+
+    #[test]
+    fn demo_includes_a_copilot_session() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        populate_demo(&mut app);
+        assert!(app.sessions.iter().any(|s| s.agent_cli == "copilot"));
+    }
 }

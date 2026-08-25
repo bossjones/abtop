@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, OpenCode, and GitHub Copilot CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code, Codex CLI, OpenCode, and Copilot CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -75,20 +75,47 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | Copilot CLI |
+| ----------------- | :---------: | :-------: | :------: | :---------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |     ✅      |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |     ⚠️      |
+| Context Window %  |     ✅      |    ✅     |    ❌    |     ✅      |
+| Status Detection  |     ✅      |    ✅     |    ✅    |     ✅      |
+| Current Task      |     ✅      |    ✅     |    ❌    |     ⚠️      |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |     ❌      |
+| Git Status        |     ✅      |    ✅     |    ✅    |     ✅      |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |     ✅      |
+| Subagents         |     ✅      |    ❌     |    ❌    |     ❌      |
+| Memory Status     |     ✅      |    ❌     |    ❌    |     ❌      |
+
+⚠️ = by default Copilot CLI reports output tokens and (once context has been
+computed at least once) context %, but not live input or cache-token counts —
+see the OpenTelemetry opt-in below to unlock full token tracking. "Current
+Task" is a synthetic status string rather than real task text, a limit of
+what Copilot CLI's own telemetry exposes.
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+
+Copilot CLI support discovers running `copilot` processes and matches each to its
+`~/.copilot/logs/process-{timestamp}-{pid}.log` file for session id, version,
+session name, and repository. Turn count, output tokens, live model/effort, and
+context usage are read from `~/.copilot/session-state/{sessionId}/events.jsonl`,
+Copilot CLI's own per-session telemetry stream; `~/.copilot/settings.json` is
+only a last-resort fallback for model/effort.
+
+By default this doesn't include live input or cache-token counts — Copilot CLI
+doesn't expose those outside of its optional OpenTelemetry export. To get full
+input/output/cache-read/cache-write token tracking, set these two environment
+variables before launching `copilot` (e.g. in your shell profile), and abtop
+will pick them up automatically per session:
+
+```bash
+export COPILOT_OTEL_ENABLED=true
+export COPILOT_OTEL_FILE_EXPORTER_PATH=~/.copilot/otel.jsonl
+```
+
+This only affects sessions started *after* the variables are set — see
+`copilot help monitoring` for details on Copilot CLI's OTel export.
 
 ## Themes
 
